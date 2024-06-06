@@ -1,5 +1,5 @@
 use crate::error::ContractError;
-use crate::state::{InsuranceInfor, INSURANCE_INFOR, MODERATOR, VAULT};
+use crate::state::{InsuranceInfor, INSURANCE_INFOR, MODERATOR, VAULT, Vault};
 use cosmwasm_std::{
     to_json_binary, Addr, DepsMut, Env, MessageInfo, Response, Uint128, WasmMsg,
 };
@@ -10,6 +10,36 @@ use cosmwasm_std::Event;
 pub mod execute {
     use super::*;
 
+    fn check_authorization(moderators: &[Addr], sender: &Addr) -> Result<(), ContractError> {
+        if !moderators.contains(sender) {
+            return Err(ContractError::Unauthorized {});
+        }
+        Ok(())
+    }
+
+    fn save_insurance_info(
+        deps: DepsMut,
+        id_insurance: String,
+        insurance_info: InsuranceInfor,
+        vault: Vault,
+        event_type: InsuranceType,
+    ) -> Result<Response, ContractError> {
+        INSURANCE_INFOR.save(deps.storage, id_insurance.clone(), &insurance_info)?;
+        VAULT.save(deps.storage, &vault)?;
+
+        let event = Event::new("EInsurance")
+            .add_attribute("id_insurance", id_insurance.clone())
+            .add_attribute("buyer", insurance_info.buyer.to_string())
+            .add_attribute("margin", insurance_info.margin.to_string())
+            .add_attribute("claim_amount", insurance_info.claim_amount.to_string())
+            .add_attribute("expired_time", insurance_info.expired_time.to_string())
+            .add_attribute("open_time", insurance_info.open_time.to_string())
+            .add_attribute("state", insurance_info.state.to_string())
+            .add_attribute("event_type", event_type.to_string());
+
+        Ok(Response::new().add_event(event))
+    }
+
     pub fn add_moderator(
         deps: DepsMut,
         _env: Env,
@@ -17,9 +47,8 @@ pub mod execute {
         new_moderator: Addr,
     ) -> Result<Response, ContractError> {
         let mut moderators = MODERATOR.load(deps.storage)?;
-        if !moderators.contains(&info.sender) {
-            return Err(ContractError::Unauthorized {});
-        }
+        check_authorization(&moderators, &info.sender)?;
+
         if !moderators.contains(&new_moderator) {
             moderators.push(new_moderator);
             MODERATOR.save(deps.storage, &moderators)?;
@@ -35,10 +64,7 @@ pub mod execute {
         moderator_to_remove: Addr,
     ) -> Result<Response, ContractError> {
         let mut moderators = MODERATOR.load(deps.storage)?;
-
-        if !moderators.contains(&info.sender) {
-            return Err(ContractError::Unauthorized {});
-        }
+        check_authorization(&moderators, &info.sender)?;
 
         if moderators.contains(&moderator_to_remove) {
             moderators.retain(|x| x != &moderator_to_remove);
@@ -55,11 +81,13 @@ pub mod execute {
         id_insurance: String,
         margin: Uint128,
     ) -> Result<Response, ContractError> {
-        match INSURANCE_INFOR.may_load(deps.storage, id_insurance.clone())? {
-            Some(_) => return Err(ContractError::AlreadyExistsInsurance {}),
-            None => {},
+        if INSURANCE_INFOR.may_load(deps.storage, id_insurance.clone())?.is_some() {
+            return Err(ContractError::AlreadyExistsInsurance {});
         }
+
         let mut vault = VAULT.load(deps.storage)?;
+        vault.margin_pool += margin;
+
         let new_insurance = InsuranceInfor {
             buyer: info.sender.clone(),
             margin,
@@ -70,11 +98,6 @@ pub mod execute {
             valid: true,
         };
 
-        INSURANCE_INFOR.save(deps.storage, id_insurance.clone(), &new_insurance)?;
-
-        vault.margin_pool += margin;
-        VAULT.save(deps.storage, &vault)?;
-
         let transfer_msg = WasmMsg::Execute {
             contract_addr: vault.contract_addr.clone(),
             msg: to_json_binary(&Cw20ExecuteMsg::TransferFrom {
@@ -84,19 +107,9 @@ pub mod execute {
             })?,
             funds: vec![],
         };
-        let event = Event::new("EInsurance")
-            .add_attribute("id_insurance", id_insurance.clone())
-            .add_attribute("buyer", info.sender.to_string())
-            .add_attribute("margin", margin)
-            .add_attribute("claim_amount", Uint128::zero())
-            .add_attribute("expired_time", Uint128::zero())
-            .add_attribute("open_time", env.block.time.seconds().to_string())
-            .add_attribute("state", InsuranceState::PENDING.to_string())
-            .add_attribute("event_type", InsuranceType::CREATED.to_string());
 
-        Ok(Response::new()
-        .add_message(transfer_msg)
-        .add_event(event))
+        save_insurance_info(deps, id_insurance, new_insurance, vault, InsuranceType::CREATED)
+            .map(|resp| resp.add_message(transfer_msg))
     }
 
     pub fn update_available_insurance(
@@ -106,32 +119,18 @@ pub mod execute {
         claim_amount: Uint128,
         expired_time: u64,
     ) -> Result<Response, ContractError> {
-        let admins = MODERATOR.load(deps.storage)?;
+        let moderators = MODERATOR.load(deps.storage)?;
+        check_authorization(&moderators, &info.sender)?;
+
         let mut vault = VAULT.load(deps.storage)?;
         let mut insurance_info = INSURANCE_INFOR.load(deps.storage, id_insurance.clone())?;
-
-        if !admins.contains(&info.sender) {
-            return Err(ContractError::Unauthorized {});
-        }
 
         insurance_info.state = InsuranceState::AVAILABLE;
         insurance_info.claim_amount = claim_amount;
         insurance_info.expired_time = expired_time;
-        vault.claim_pool = vault.claim_pool + claim_amount;
+        vault.claim_pool += claim_amount;
 
-        INSURANCE_INFOR.save(deps.storage, id_insurance.clone(), &insurance_info)?;
-        VAULT.save(deps.storage, &vault)?;
-
-        let event = Event::new("EInsurance")
-            .add_attribute("id_insurance", id_insurance.clone())
-            .add_attribute("buyer", insurance_info.buyer)
-            .add_attribute("margin", insurance_info.margin)
-            .add_attribute("claim_amount", Uint128::zero())
-            .add_attribute("expired_time", expired_time.to_string())
-            .add_attribute("open_time", insurance_info.open_time.to_string())
-            .add_attribute("state", InsuranceState::AVAILABLE.to_string())
-            .add_attribute("event_type", InsuranceType::UPDATEAVAILABLE.to_string());
-        Ok(Response::new().add_event(event))
+        save_insurance_info(deps, id_insurance, insurance_info, vault, InsuranceType::UPDATEAVAILABLE)
     }
 
     pub fn update_invalid_insurance(
@@ -139,17 +138,15 @@ pub mod execute {
         info: MessageInfo,
         id_insurance: String,
     ) -> Result<Response, ContractError> {
-        let admins = MODERATOR.load(deps.storage)?;
+        let moderators = MODERATOR.load(deps.storage)?;
+        check_authorization(&moderators, &info.sender)?;
+
         let mut vault = VAULT.load(deps.storage)?;
         let mut insurance_info = INSURANCE_INFOR.load(deps.storage, id_insurance.clone())?;
-        if !admins.contains(&info.sender) {
-            return Err(ContractError::Unauthorized {});
-        }
 
         insurance_info.state = InsuranceState::INVALID;
-
         let margin = insurance_info.margin;
-        vault.margin_pool = vault.margin_pool - margin;
+        vault.margin_pool -= margin;
 
         insurance_info.margin = Uint128::zero();
 
@@ -162,20 +159,8 @@ pub mod execute {
             funds: vec![],
         };
 
-        INSURANCE_INFOR.save(deps.storage, id_insurance.clone(), &insurance_info)?;
-        VAULT.save(deps.storage, &vault)?;
-
-        let event = Event::new("EInsurance")
-            .add_attribute("id_insurance", id_insurance.clone())
-            .add_attribute("buyer", insurance_info.buyer)
-            .add_attribute("margin", Uint128::zero())
-            .add_attribute("claim_amount", insurance_info.claim_amount)
-            .add_attribute("expired_time", insurance_info.expired_time.to_string())
-            .add_attribute("open_time", insurance_info.expired_time.to_string())
-            .add_attribute("state", InsuranceState::INVALID.to_string())
-            .add_attribute("event_type", InsuranceType::UPDATEINVALID.to_string());
-
-        Ok(Response::new().add_message(transfer_msg).add_event(event))
+        save_insurance_info(deps, id_insurance, insurance_info, vault, InsuranceType::UPDATEINVALID)
+            .map(|resp| resp.add_message(transfer_msg))
     }
 
     pub fn claim_insurance(
@@ -184,18 +169,15 @@ pub mod execute {
         id_insurance: String,
     ) -> Result<Response, ContractError> {
         let moderators = MODERATOR.load(deps.storage)?;
+        check_authorization(&moderators, &info.sender)?;
+
         let mut insurance_info = INSURANCE_INFOR.load(deps.storage, id_insurance.clone())?;
         let mut vault = VAULT.load(deps.storage)?;
-        if !moderators.contains(&info.sender) {
-            return Err(ContractError::Unauthorized {});
-        }
 
         insurance_info.state = InsuranceState::CLAIMED;
-
-        vault.claim_pool = vault.claim_pool - insurance_info.claim_amount;
+        vault.claim_pool -= insurance_info.claim_amount;
 
         let claim_amount = insurance_info.claim_amount;
-
         insurance_info.claim_amount = Uint128::zero();
 
         let transfer_msg = WasmMsg::Execute {
@@ -207,20 +189,8 @@ pub mod execute {
             funds: vec![],
         };
 
-        INSURANCE_INFOR.save(deps.storage, id_insurance.clone(), &insurance_info)?;
-        VAULT.save(deps.storage, &vault)?;
-
-        let event = Event::new("EInsurance")
-            .add_attribute("id_insurance", id_insurance.clone())
-            .add_attribute("buyer", insurance_info.buyer)
-            .add_attribute("margin", Uint128::zero())
-            .add_attribute("claim_amount", Uint128::zero())
-            .add_attribute("expired_time", insurance_info.expired_time.to_string())
-            .add_attribute("open_time", insurance_info.expired_time.to_string())
-            .add_attribute("state", InsuranceState::CLAIMED.to_string())
-            .add_attribute("event_type", InsuranceType::CLAIM.to_string());
-
-        Ok(Response::new().add_message(transfer_msg).add_event(event))
+        save_insurance_info(deps, id_insurance, insurance_info, vault, InsuranceType::CLAIM)
+            .map(|resp| resp.add_message(transfer_msg))
     }
 
     pub fn refund_insurance(
@@ -228,17 +198,16 @@ pub mod execute {
         info: MessageInfo,
         id_insurance: String,
     ) -> Result<Response, ContractError> {
+        let moderators = MODERATOR.load(deps.storage)?;
+        check_authorization(&moderators, &info.sender)?;
+
         let mut vault = VAULT.load(deps.storage)?;
         let mut insurance_info = INSURANCE_INFOR.load(deps.storage, id_insurance.clone())?;
-        let moderators = MODERATOR.load(deps.storage)?;
-        if !moderators.contains(&info.sender) {
-            return Err(ContractError::Unauthorized {});
-        }
 
         insurance_info.state = InsuranceState::REFUNDED;
         let margin = insurance_info.margin;
 
-        vault.margin_pool = vault.margin_pool - margin;
+        vault.margin_pool -= margin;
         insurance_info.margin = Uint128::zero();
 
         let transfer_msg = WasmMsg::Execute {
@@ -249,19 +218,9 @@ pub mod execute {
             })?,
             funds: vec![],
         };
-
-        INSURANCE_INFOR.save(deps.storage, id_insurance.clone(), &insurance_info)?;
-        let event = Event::new("EInsurance")
-            .add_attribute("id_insurance", id_insurance.clone())
-            .add_attribute("buyer", insurance_info.buyer)
-            .add_attribute("margin", Uint128::zero())
-            .add_attribute("claim_amount", insurance_info.claim_amount)
-            .add_attribute("expired_time", insurance_info.expired_time.to_string())
-            .add_attribute("open_time", insurance_info.expired_time.to_string())
-            .add_attribute("state", InsuranceState::REFUNDED.to_string())
-            .add_attribute("event_type", InsuranceType::REFUND.to_string());
-
-        Ok(Response::new().add_message(transfer_msg).add_event(event))
+        
+        save_insurance_info(deps, id_insurance, insurance_info, vault, InsuranceType::REFUND)
+            .map(|resp| resp.add_message(transfer_msg))
     }
 
     pub fn cancel_insurance(
@@ -270,16 +229,15 @@ pub mod execute {
         id_insurance: String,
     ) -> Result<Response, ContractError> {
         let moderators = MODERATOR.load(deps.storage)?;
+        check_authorization(&moderators, &info.sender)?;
+
         let mut vault = VAULT.load(deps.storage)?;
         let mut insurance_info = INSURANCE_INFOR.load(deps.storage, id_insurance.clone())?;
 
-        if !moderators.contains(&info.sender) {
-            return Err(ContractError::Unauthorized {});
-        }
-
         insurance_info.state = InsuranceState::CANCELED;
         let margin = insurance_info.margin;
-        vault.margin_pool = vault.margin_pool - margin;
+
+        vault.margin_pool -= margin;
         insurance_info.margin = Uint128::zero();
 
         let transfer_msg = WasmMsg::Execute {
@@ -290,20 +248,9 @@ pub mod execute {
             })?,
             funds: vec![],
         };
-        INSURANCE_INFOR.save(deps.storage, id_insurance.clone(), &insurance_info)?;
-        VAULT.save(deps.storage, &vault)?;
 
-        let event = Event::new("EInsurance")
-            .add_attribute("id_insurance", id_insurance.clone())
-            .add_attribute("buyer", insurance_info.buyer)
-            .add_attribute("margin", Uint128::zero())
-            .add_attribute("claim_amount", insurance_info.claim_amount)
-            .add_attribute("expired_time", insurance_info.expired_time.to_string())
-            .add_attribute("open_time", insurance_info.expired_time.to_string())
-            .add_attribute("state", InsuranceState::CANCELED.to_string())
-            .add_attribute("event_type", InsuranceType::CANCEL.to_string());
-
-        Ok(Response::new().add_message(transfer_msg).add_event(event))
+        save_insurance_info(deps, id_insurance, insurance_info, vault, InsuranceType::CANCEL)
+            .map(|resp| resp.add_message(transfer_msg))
     }
 
     pub fn expire_insurance(
@@ -360,5 +307,4 @@ pub mod execute {
 
         Ok(Response::new().add_event(event))
     }
-
 }

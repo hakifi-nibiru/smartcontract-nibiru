@@ -36,7 +36,7 @@ pub struct  InsuranceInfor {
 
 pub const INSURANCE_INFOR: Map<String, InsuranceInfor> = Map::new("insurance_infor");
 
-pub const MODERATOR: Item<Vec<Addr>> = Item::new("admins");
+pub const MODERATOR: Item<Vec<Addr>> = Item::new("moderators");
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 pub enum InsuranceState {

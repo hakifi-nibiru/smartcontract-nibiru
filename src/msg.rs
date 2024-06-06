@@ -41,4 +41,5 @@ pub enum ExecuteMsg {
 #[cw_serde]
 pub enum QueryMsg {
     GetInsuranceInfo { id_insurance: String },
+    GetVaultInfo {},
 }
